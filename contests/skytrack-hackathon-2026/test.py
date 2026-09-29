@@ -1,14 +1,14 @@
-"""Two-stage pilot on Survey 12: coarse 25 m scan, targeted 5 m scan, spray.
+"""Two-stage whole-field mission: coarse 25 m scan, targeted 5 m scan, spray.
 
-1. Screen the Survey 12 field at 25 m using 15 m colour-context tiles.
-2. Re-scan likely/uncertain tiles and a sample of negatives at 5 m.
+1. Screen the supplied crop polygon at 25 m using 15 m colour-context tiles.
+2. Re-scan mottled/uncertain tiles and a small validation sample at 5 m.
 3. Make the precise stress map, then spray its safe polygons at 3 m.
 4. Route all transits around the three published no-fly polygons and land.
 
 Coordinates are world ENU (x east, y north, z up). ``fly_to`` and the pose
 are NED: ``fly_to(north=y, east=x)`` and ``east, north = pose.y, pose.x``.
 
-Paste this file into the SkyTrack mission-script editor to run the pilot.
+Paste this file into the SkyTrack mission-script editor to run the mission.
 """
 from __future__ import annotations
 
@@ -146,15 +146,29 @@ SURVEYS = [
     SURVEY_WAYPOINTS_ENU_15,
 ]
 
-# Pilot only: Survey 12 is one large, no-fly-clear field cluster. Keep the
-# other supplied surveys above intact for a later full-map mission.
-PILOT_SURVEY = SURVEY_WAYPOINTS_ENU_12
+# Supplied crop boundary, in perimeter order. The UI's z=2 m is NOT the
+# survey altitude: the screening pass below flies at COARSE_ALT_M=25 m.
+AOI_BOUNDARY_WAYPOINTS_ENU = [
+    (-11.09, -18.69, 2.0), (-53.85, -21.44, 2.0),
+    (37.14, -566.11, 2.0), (167.72, -554.10, 2.0),
+    (229.75, -635.80, 2.0), (286.88, -609.63, 2.0),
+    (433.17, -586.10, 2.0), (376.41, -22.21, 2.0),
+    (306.41, 2.63, 2.0), (214.74, -5.24, 2.0),
+    (160.29, -31.22, 2.0), (15.70, -23.01, 2.0),
+]
+AOI_POLYGON_ENU = [(x, y) for x, y, _ in AOI_BOUNDARY_WAYPOINTS_ENU]
 COARSE_ALT_M = 25.0
-COARSE_SPEED_M_S = 6.0
+COARSE_SPEED_M_S = 8.0
 COARSE_TILE_M = 15.0
-COARSE_LANE_SPACING_M = 35.0
+COARSE_MICRO_M = 5.0
+COARSE_MICROS_PER_TILE = int(COARSE_TILE_M / COARSE_MICRO_M)
+COARSE_LANE_SPACING_M = 40.0
+COARSE_MIN_RUN_M = 15.0
+AOI_FLIGHT_MARGIN_M = 4.0
 FINE_ALT_M = 5.0
 FINE_LANE_SPACING_M = 8.0
+FINE_CLUSTER_TILES = 4  # at most 60 m x 60 m per 0.2 m stress map
+COLD_CHECK_STRIDE = 20
 COARSE_MAP_PATH = Path("/root/.ros/captures/coarse_candidate_map.json")
 
 SURVEY_SPEED_M_S = 3.0
@@ -819,29 +833,74 @@ def ensure_sprayer_open(
     return True
 
 
-def pilot_bounds() -> tuple[float, float, float, float]:
-    """Survey 12's field envelope, not the surrounding residential areas."""
+def aoi_bounds() -> tuple[float, float, float, float]:
+    """Bounding box of the supplied crop polygon, in world ENU metres."""
     return (
-        min(p[0] for p in PILOT_SURVEY), max(p[0] for p in PILOT_SURVEY),
-        min(p[1] for p in PILOT_SURVEY), max(p[1] for p in PILOT_SURVEY),
+        min(p[0] for p in AOI_POLYGON_ENU), max(p[0] for p in AOI_POLYGON_ENU),
+        min(p[1] for p in AOI_POLYGON_ENU), max(p[1] for p in AOI_POLYGON_ENU),
     )
 
 
+def _point_inside_safe_aoi(point: tuple[float, float]) -> bool:
+    if not _point_in_polygon(point, AOI_POLYGON_ENU):
+        return False
+    if any(_point_segment_distance(point, a, b) < AOI_FLIGHT_MARGIN_M
+           for a, b in zip(AOI_POLYGON_ENU,
+                           AOI_POLYGON_ENU[1:] + AOI_POLYGON_ENU[:1])):
+        return False
+    # Sampled waypoints are one metre apart; the extra metre guarantees
+    # >=5 m no-fly clearance between samples as well as at them.
+    return _point_clear(point, NO_FLY_CLEARANCE_M + 1.0)
+
+
+def _safe_scan_runs(
+    *, fixed: float, low: float, high: float, vertical: bool,
+    minimum_m: float,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Clip a straight scan line to the crop AOI minus buffered no-fly zones."""
+    samples = max(2, math.ceil(high - low) + 1)
+    coordinates = np.linspace(low, high, samples)
+    allowed = [
+        _point_inside_safe_aoi((fixed, float(v)) if vertical else (float(v), fixed))
+        for v in coordinates
+    ]
+    runs = []
+    first = None
+    for index, safe in enumerate(allowed + [False]):
+        if safe and first is None:
+            first = index
+        elif not safe and first is not None:
+            last = index - 1
+            if float(coordinates[last] - coordinates[first]) >= minimum_m:
+                a, b = float(coordinates[first]), float(coordinates[last])
+                start, end = ((fixed, a), (fixed, b)) if vertical else ((a, fixed), (b, fixed))
+                if not _segment_clear(start, end):
+                    raise RuntimeError(f"Unsafe clipped scan leg: {start} -> {end}")
+                runs.append((start, end))
+            first = None
+    return runs
+
+
 def coarse_scan_segments() -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    x0, x1, y0, y1 = pilot_bounds()
+    x0, x1, y0, y1 = aoi_bounds()
     width = x1 - x0
-    if width <= 30.0:
+    if width <= 40.0:
         xs = [0.5 * (x0 + x1)]
     else:
-        count = max(2, math.ceil((width - 30.0) / COARSE_LANE_SPACING_M) + 1)
-        xs = np.linspace(x0 + 15.0, x1 - 15.0, count).tolist()
+        count = max(2, math.ceil((width - 40.0) / COARSE_LANE_SPACING_M) + 1)
+        xs = np.linspace(x0 + 20.0, x1 - 20.0, count).tolist()
     segments = []
     for index, x in enumerate(xs):
-        endpoints = ((x, y1 - 4.0), (x, y0 + 4.0))
-        start, end = endpoints if index % 2 == 0 else endpoints[::-1]
-        if not _segment_clear(start, end):
-            raise ValueError(f"Coarse scan leg enters a no-fly buffer: {start} -> {end}")
-        segments.append((start, end))
+        runs = _safe_scan_runs(
+            fixed=float(x), low=y0, high=y1, vertical=True,
+            minimum_m=COARSE_MIN_RUN_M,
+        )
+        if index % 2 == 0:
+            segments.extend((end, start) for start, end in reversed(runs))
+        else:
+            segments.extend(runs)
+    if not segments:
+        raise RuntimeError("No legal 25 m scan line inside the supplied AOI")
     return segments
 
 
@@ -849,28 +908,46 @@ class CoarseMap:
     """25 m screening map. Its 15 m tiles are NOT spray polygons."""
 
     def __init__(self) -> None:
-        self.x0, self.x1, self.y0, self.y1 = pilot_bounds()
+        self.x0, self.x1, self.y0, self.y1 = aoi_bounds()
         self.cols = math.ceil((self.x1 - self.x0) / COARSE_TILE_M)
         self.rows = math.ceil((self.y1 - self.y0) / COARSE_TILE_M)
+        self.micro_cols = math.ceil((self.x1 - self.x0) / COARSE_MICRO_M)
+        self.micro_rows = math.ceil((self.y1 - self.y0) / COARSE_MICRO_M)
         shape = (self.rows, self.cols)
         self.seen = np.zeros(shape, dtype=np.int64)
         self.green = np.zeros(shape, dtype=np.int64)
         self.yellow = np.zeros(shape, dtype=np.int64)
         self.brown = np.zeros(shape, dtype=np.int64)
+        micro_shape = (self.micro_rows, self.micro_cols)
+        self.micro_seen = np.zeros(micro_shape, dtype=np.int64)
+        self.micro_green = np.zeros(micro_shape, dtype=np.int64)
+        self.micro_yellow = np.zeros(micro_shape, dtype=np.int64)
+        self.micro_brown = np.zeros(micro_shape, dtype=np.int64)
         self.pictures = 0
         self._last_seq = -1
+        self.micro_safe = np.zeros(micro_shape, dtype=bool)
         self.safe = np.zeros(shape, dtype=bool)
-        for row in range(self.rows):
-            for col in range(self.cols):
-                xa = self.x0 + col * COARSE_TILE_M
-                xb = min(self.x1, xa + COARSE_TILE_M)
-                ya = self.y0 + row * COARSE_TILE_M
-                yb = min(self.y1, ya + COARSE_TILE_M)
+        for row in range(self.micro_rows):
+            for col in range(self.micro_cols):
+                xa = self.x0 + col * COARSE_MICRO_M
+                xb = min(self.x1, xa + COARSE_MICRO_M)
+                ya = self.y0 + row * COARSE_MICRO_M
+                yb = min(self.y1, ya + COARSE_MICRO_M)
+                centre = (0.5 * (xa + xb), 0.5 * (ya + yb))
                 half_diagonal = 0.5 * math.hypot(xb - xa, yb - ya)
-                self.safe[row, col] = _point_clear(
-                    (0.5 * (xa + xb), 0.5 * (ya + yb)),
-                    NO_FLY_CLEARANCE_M + half_diagonal,
+                inside_crop = (
+                    _point_in_polygon(centre, AOI_POLYGON_ENU)
+                    and all(_point_segment_distance(centre, a, b) >= half_diagonal
+                            for a, b in zip(AOI_POLYGON_ENU,
+                                            AOI_POLYGON_ENU[1:] + AOI_POLYGON_ENU[:1]))
                 )
+                if inside_crop and _point_clear(
+                    centre, NO_FLY_CLEARANCE_M + half_diagonal,
+                ):
+                    self.micro_safe[row, col] = True
+                    tile_row = min(self.rows - 1, row // COARSE_MICROS_PER_TILE)
+                    tile_col = min(self.cols - 1, col // COARSE_MICROS_PER_TILE)
+                    self.safe[tile_row, tile_col] = True
 
     def snap(self, ctx: Any) -> None:
         camera = ctx.senses.camera
@@ -879,11 +956,10 @@ class CoarseMap:
         pose = ctx.senses.pose.current_position
         if pose is None:
             return
-        path = ctx.services.snapshot.snap()
-        picture = cv2.imread(path) if path else None
-        if picture is None:
+        rgb = camera.decode()  # SkyTrack /camera is rgb8; no cloud PNG write.
+        if rgb is None:
             return
-        self.add_picture(cv2.cvtColor(picture, cv2.COLOR_BGR2RGB), pose)
+        self.add_picture(rgb, pose)
         self._last_seq = camera.seq
         self.pictures += 1
 
@@ -921,27 +997,41 @@ class CoarseMap:
         north = pose.x - right * sin_h - back * cos_h
         col = np.floor((east - self.x0) / COARSE_TILE_M).astype(int)
         row = np.floor((north - self.y0) / COARSE_TILE_M).astype(int)
+        micro_col = np.floor((east - self.x0) / COARSE_MICRO_M).astype(int)
+        micro_row = np.floor((north - self.y0) / COARSE_MICRO_M).astype(int)
         inside = ((row >= 0) & (row < self.rows)
-                  & (col >= 0) & (col < self.cols) & ~occluded & bright[v, u])
-        row, col, v, u = row[inside], col[inside], v[inside], u[inside]
+                  & (col >= 0) & (col < self.cols)
+                  & (micro_row >= 0) & (micro_row < self.micro_rows)
+                  & (micro_col >= 0) & (micro_col < self.micro_cols)
+                  & ~occluded & bright[v, u])
+        row, col = row[inside], col[inside]
+        micro_row, micro_col = micro_row[inside], micro_col[inside]
+        v, u = v[inside], u[inside]
         if row.size == 0:
             return
-        allowed = self.safe[row, col]
-        row, col, v, u = row[allowed], col[allowed], v[allowed], u[allowed]
+        allowed = self.micro_safe[micro_row, micro_col]
+        row, col = row[allowed], col[allowed]
+        micro_row, micro_col = micro_row[allowed], micro_col[allowed]
+        v, u = v[allowed], u[allowed]
         flat = row * self.cols + col
-        for target, colour in (
-            (self.seen, np.ones(flat.shape, dtype=bool)),
-            (self.green, green[v, u]),
-            (self.yellow, yellow[v, u]),
-            (self.brown, brown[v, u]),
-        ):
-            target += np.bincount(
-                flat, weights=colour.astype(np.int32),
-                minlength=self.rows * self.cols,
-            ).reshape(target.shape).astype(np.int64)
+        micro_flat = micro_row * self.micro_cols + micro_col
+        colours = (
+            (np.ones(flat.shape, dtype=bool), self.seen, self.micro_seen),
+            (green[v, u], self.green, self.micro_green),
+            (yellow[v, u], self.yellow, self.micro_yellow),
+            (brown[v, u], self.brown, self.micro_brown),
+        )
+        for colour, tile_target, micro_target in colours:
+            weights = colour.astype(np.int32)
+            tile_target += np.bincount(
+                flat, weights=weights, minlength=tile_target.size,
+            ).reshape(tile_target.shape).astype(np.int64)
+            micro_target += np.bincount(
+                micro_flat, weights=weights, minlength=micro_target.size,
+            ).reshape(micro_target.shape).astype(np.int64)
 
     def candidates(self) -> tuple[np.ndarray, list[dict[str, Any]]]:
-        """Conservative screening: uncertain tiles get a low-altitude check."""
+        """Use 5 m subtiles to separate uniform colour from mottled crop."""
         labels = np.full((self.rows, self.cols), "excluded", dtype=object)
         records = []
         for row in range(self.rows):
@@ -952,14 +1042,46 @@ class CoarseMap:
                 green_fraction = float(self.green[row, col]) / max(1, crop)
                 stress_fraction = float(self.yellow[row, col]
                                         + self.brown[row, col]) / max(1, crop)
+                yellow_fraction = float(self.yellow[row, col]) / max(1, crop)
+                brown_fraction = float(self.brown[row, col]) / max(1, crop)
+                micros = np.s_[
+                    row * COARSE_MICROS_PER_TILE:
+                    min(self.micro_rows, (row + 1) * COARSE_MICROS_PER_TILE),
+                    col * COARSE_MICROS_PER_TILE:
+                    min(self.micro_cols, (col + 1) * COARSE_MICROS_PER_TILE),
+                ]
+                micro_seen = self.micro_seen[micros]
+                micro_crop = (self.micro_green[micros]
+                              + self.micro_yellow[micros] + self.micro_brown[micros])
+                valid_micro = ((micro_seen >= 20)
+                               & (micro_crop >= 0.30 * np.maximum(1, micro_seen)))
+                local_stress = (
+                    (self.micro_yellow[micros] + self.micro_brown[micros])
+                    / np.maximum(1, micro_crop)
+                )[valid_micro]
+                patch_peak = float(np.max(local_stress)) if local_stress.size else 0.0
+                patch_spread = (float(np.max(local_stress) - np.min(local_stress))
+                                if local_stress.size >= 2 else 0.0)
                 if self.safe[row, col]:
-                    if count < 40:
+                    if count < 40 or np.count_nonzero(valid_micro) < 2:
                         label = "uncertain"
                     elif crop / count < 0.30:
                         label = "noncrop"
-                    elif green_fraction >= 0.18 and 0.18 <= stress_fraction <= 0.80:
+                    elif (green_fraction >= 0.85 and patch_peak < 0.15
+                          and patch_spread < 0.12):
+                        label = "uniform_green"
+                    elif (green_fraction <= 0.08 and yellow_fraction >= 0.80
+                          and patch_spread < 0.12):
+                        label = "uniform_yellow"
+                    elif (green_fraction >= 0.15 and stress_fraction <= 0.85
+                          and ((stress_fraction >= 0.18 and patch_spread >= 0.10)
+                               or (stress_fraction >= 0.05 and patch_peak >= 0.28
+                                   and patch_spread >= 0.18))):
                         label = "hot"
-                    elif green_fraction >= 0.08 and stress_fraction >= 0.08:
+                    elif (green_fraction >= 0.08
+                          and (stress_fraction >= 0.06 or patch_peak >= 0.20)):
+                        label = "uncertain"
+                    elif brown_fraction >= 0.25:
                         label = "uncertain"
                     else:
                         label = "cold"
@@ -974,20 +1096,22 @@ class CoarseMap:
                     ],
                     "seen": count, "crop_fraction": round(crop / max(1, count), 3),
                     "green_fraction": round(green_fraction, 3),
-                    "yellow_fraction": round(float(self.yellow[row, col]) / max(1, crop), 3),
-                    "brown_fraction": round(float(self.brown[row, col]) / max(1, crop), 3),
+                    "yellow_fraction": round(yellow_fraction, 3),
+                    "brown_fraction": round(brown_fraction, 3),
+                    "patch_peak": round(patch_peak, 3),
+                    "patch_spread": round(patch_spread, 3),
                 })
         selected = (labels == "hot") | (labels == "uncertain")
-        # Include one neighbouring tile around a hotspot to avoid clipping
-        # its boundary at the arbitrary 15 m grid line.
+        # A one-tile halo catches patch edges, but strong uniform green/yellow
+        # tiles remain skipped as requested.
         hot_neighbours = cv2.dilate(
             (labels == "hot").astype(np.uint8), np.ones((3, 3), np.uint8),
         ) > 0
-        selected |= hot_neighbours & (labels != "noncrop")
-        # Validate high-altitude negatives on a deterministic 20% sample.
+        selected |= hot_neighbours & ((labels == "cold") | (labels == "uncertain"))
+        # Only weakly classified negatives are sampled, not large uniform fields.
         cold = [(r, c) for r in range(self.rows) for c in range(self.cols)
                 if labels[r, c] == "cold"]
-        for index in range(0, len(cold), 5):
+        for index in range(0, len(cold), COLD_CHECK_STRIDE):
             selected[cold[index]] = True
         selected &= self.safe
         for record in records:
@@ -998,16 +1122,20 @@ class CoarseMap:
 def fine_scan_segments(
     coarse: CoarseMap, selected: np.ndarray,
     current: tuple[float, float],
+    row_range: tuple[int, int] | None = None,
+    col_range: tuple[int, int] | None = None,
 ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    first_row, last_row = row_range or (0, coarse.rows)
+    first_col, last_col = col_range or (0, coarse.cols)
     pending = []
-    for row in range(coarse.rows):
-        col = 0
-        while col < coarse.cols:
+    for row in range(first_row, last_row):
+        col = first_col
+        while col < last_col:
             if not selected[row, col]:
                 col += 1
                 continue
             first = col
-            while col < coarse.cols and selected[row, col]:
+            while col < last_col and selected[row, col]:
                 col += 1
             xa = coarse.x0 + first * COARSE_TILE_M
             xb = min(coarse.x1, coarse.x0 + col * COARSE_TILE_M)
@@ -1021,13 +1149,10 @@ def fine_scan_segments(
                 lane_count = max(2, math.ceil((yb - ya - 8.0) / FINE_LANE_SPACING_M) + 1)
                 ys = np.linspace(ya + 4.0, yb - 4.0, lane_count)
             for y in ys:
-                if xb - xa < 8.0:
-                    start_x, end_x = max(coarse.x0, xb - 8.0), xb
-                else:
-                    start_x, end_x = xa + 3.0, xb - 3.0
-                start, end = (start_x, float(y)), (end_x, float(y))
-                if _segment_clear(start, end):
-                    pending.append((start, end))
+                pending.extend(_safe_scan_runs(
+                    fixed=float(y), low=xa, high=xb, vertical=False,
+                    minimum_m=4.0,
+                ))
 
     ordered = []
     while pending:
@@ -1045,8 +1170,32 @@ def fine_scan_segments(
     return ordered
 
 
+def candidate_blocks(
+    coarse: CoarseMap, selected: np.ndarray,
+    records: list[dict[str, Any]],
+) -> list[tuple[int, int, int, int, int]]:
+    """Bound each detailed 0.2 m map to a small part of the large AOI."""
+    hot = np.zeros(selected.shape, dtype=bool)
+    uncertain = np.zeros(selected.shape, dtype=bool)
+    for record in records:
+        index = record["row"], record["col"]
+        hot[index] = record["label"] == "hot"
+        uncertain[index] = record["label"] == "uncertain"
+    blocks = []
+    for row in range(0, coarse.rows, FINE_CLUSTER_TILES):
+        row_end = min(coarse.rows, row + FINE_CLUSTER_TILES)
+        for col in range(0, coarse.cols, FINE_CLUSTER_TILES):
+            col_end = min(coarse.cols, col + FINE_CLUSTER_TILES)
+            if np.any(selected[row:row_end, col:col_end]):
+                priority = (0 if np.any(hot[row:row_end, col:col_end])
+                            else 1 if np.any(uncertain[row:row_end, col:col_end])
+                            else 2)
+                blocks.append((priority, row, row_end, col, col_end))
+    return blocks
+
+
 def hackathon_mission(ctx: Any) -> Iterator[Any]:
-    """Pilot Survey 12: coarse screen, targeted close scan, spray, land."""
+    """Scan all legal crop at 25 m, then inspect and treat candidate blocks."""
     log = ctx.world.log_info
     home = ctx.senses.pose.current_position
     home_north, home_east = home.x, home.y
@@ -1057,7 +1206,8 @@ def hackathon_mission(ctx: Any) -> Iterator[Any]:
         (x, y, COARSE_ALT_M) for start, end in coarse_legs for x, y in (start, end)
     ]
     detours = preflight_no_fly_routes((home_east, home_north), [coarse_waypoints])
-    log(f"[PILOT] Survey 12 only; {len(coarse_legs)} coarse legs at 25 m")
+    log(f"[AOI] whole crop polygon; {len(coarse_legs)} coarse legs at 25 m; "
+        f"scan distance={sum(math.dist(a, b) for a, b in coarse_legs):.0f} m")
     log(f"[NFZ] coarse route preflight passed; {detours} detour(s)")
 
     coarse = CoarseMap()
@@ -1083,7 +1233,7 @@ def hackathon_mission(ctx: Any) -> Iterator[Any]:
             yield scan_step
             if scan_result["timed_out"]:
                 ctx.world.log_warn(
-                    f"[PILOT] coarse leg {leg_index} incomplete; "
+                    f"[AOI] coarse leg {leg_index} incomplete; "
                     "unobserved tiles will be checked at 5 m"
                 )
         finally:
@@ -1092,50 +1242,82 @@ def hackathon_mission(ctx: Any) -> Iterator[Any]:
     selected, records = coarse.candidates()
     crop_total = int(np.sum(coarse.green + coarse.yellow + coarse.brown))
     seen_total = int(np.sum(coarse.seen))
-    if coarse.pictures < 3 or crop_total / max(1, seen_total) < 0.12:
-        # A failed camera/colour calibration must not silently declare the
-        # whole field healthy and skip the ground-truthing stage.
-        selected = coarse.safe.copy()
-        for record in records:
-            record["fine_scan"] = bool(selected[record["row"], record["col"]])
+    safe_tiles = int(np.count_nonzero(coarse.safe))
+    observed_tiles = int(np.count_nonzero((coarse.seen >= 40) & coarse.safe))
+    observed_fraction = observed_tiles / max(1, safe_tiles)
+    reliable = (coarse.pictures >= 10 and observed_fraction >= 0.45
+                and crop_total / max(1, seen_total) >= 0.12)
+    if not reliable:
         ctx.world.log_warn(
-            "[PILOT] coarse evidence unreliable; scanning the whole safe "
-            "pilot field at 5 m"
+            f"[AOI] coarse evidence unreliable (frames={coarse.pictures}, "
+            f"observed={observed_fraction:.0%}); returning home instead of "
+            "declaring the field healthy"
         )
     counts = {label: sum(record["label"] == label for record in records)
-              for label in ("hot", "uncertain", "cold", "noncrop", "excluded")}
+              for label in ("hot", "uncertain", "uniform_green",
+                            "uniform_yellow", "cold", "noncrop", "excluded")}
     coarse_report = {
         "stage": "coarse_25m_screening_not_final_detection",
-        "survey": 12, "bounds_enu": pilot_bounds(),
+        "aoi_polygon_enu": AOI_POLYGON_ENU, "bounds_enu": aoi_bounds(),
         "tile_m": COARSE_TILE_M, "pictures": coarse.pictures,
-        "counts": counts, "tiles": records,
+        "observed_fraction": round(observed_fraction, 3),
+        "reliable": reliable, "counts": counts, "tiles": records,
     }
     COARSE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
     COARSE_MAP_PATH.write_text(json.dumps(coarse_report, separators=(",", ":")))
-    log(f"[PILOT] coarse pictures={coarse.pictures}; tiles={counts}; "
+    log(f"[AOI] coarse pictures={coarse.pictures}; tiles={counts}; "
         f"selected={int(np.count_nonzero(selected))}; map={COARSE_MAP_PATH}")
     hot_centers = [record["center_enu"] for record in records
                    if record["label"] == "hot"]
-    log(f"[PILOT] hot tile centres ENU (first 12): {hot_centers[:12]}")
+    log(f"[AOI] mottled hot tile centres ENU (first 12): {hot_centers[:12]}")
+    candidate_centers = [
+        (record["label"], record["center_enu"])
+        for record in records if record["label"] in ("hot", "uncertain")
+    ]
+    if reliable:
+        for offset in range(0, len(candidate_centers), 20):
+            log(f"[AOI] candidates {offset + 1}-"
+                f"{min(offset + 20, len(candidate_centers))}: "
+                f"{candidate_centers[offset:offset + 20]}")
 
-    pose = ctx.senses.pose.current_position
-    current = (float(pose.y), float(pose.x))
-    fine_legs = fine_scan_segments(coarse, selected, current)
-    log(f"[PILOT] planned {len(fine_legs)} targeted 5 m scan legs")
-    if fine_legs:
+    all_areas: list[dict[str, Any]] = []
+    blocks = candidate_blocks(coarse, selected, records) if reliable else []
+    log(f"[AOI] targeted 5 m scan blocks={len(blocks)}")
+    block_index = 0
+    while blocks:
+        pose = ctx.senses.pose.current_position
+        current = (float(pose.y), float(pose.x))
+        closest = min(range(len(blocks)), key=lambda index: (
+            blocks[index][0],
+            math.dist(
+                current,
+                (coarse.x0 + 0.5 * (blocks[index][3] + blocks[index][4]) * COARSE_TILE_M,
+                 coarse.y0 + 0.5 * (blocks[index][1] + blocks[index][2]) * COARSE_TILE_M),
+            ),
+        ))
+        priority, row0, row1, col0, col1 = blocks.pop(closest)
+        fine_legs = fine_scan_segments(
+            coarse, selected, current,
+            row_range=(row0, row1), col_range=(col0, col1),
+        )
+        if not fine_legs:
+            log(f"[AOI] block ({row0},{col0}) has no legal fine-scan leg; skipped")
+            continue
+        block_index += 1
         fine_waypoints = [
             (x, y, FINE_ALT_M) for start, end in fine_legs for x, y in (start, end)
         ]
         detours = preflight_no_fly_routes(current, [fine_waypoints])
-        log(f"[NFZ] fine route preflight passed; {detours} detour(s)")
+        log(f"[AOI] block {block_index}: priority={priority}, "
+            f"tile_rows={row0}:{row1}, tile_cols={col0}:{col1}, "
+            f"{len(fine_legs)} fine scan legs; NFZ detours={detours}")
         areas = yield from scan_detect_spray(
-            ctx, survey_index=12, waypoints=fine_waypoints,
-            sprayer=sprayer, scan_segments=fine_legs,
+            ctx, survey_index=block_index, waypoints=fine_waypoints,
+            sprayer=sprayer, scan_segments=fine_legs, prior_areas=all_areas,
         )
-        save_stress_areas(areas)
-        log(f"[PILOT] fine scan and spray done; stress areas={len(areas)}")
-    else:
-        log("[PILOT] no safe candidate fine-scan legs; no spray commanded")
+        all_areas.extend(areas)
+        save_stress_areas(all_areas)
+        log(f"[AOI] block {block_index} done; total stress areas={len(all_areas)}")
 
     yield from recharge_if_needed(ctx, resume_alt_m=CHARGE_TRANSIT_ALT_M)
     yield from safe_fly_to(
@@ -1154,6 +1336,7 @@ def scan_detect_spray(
     waypoints: list[tuple[float, float, float]],
     sprayer: Any,
     scan_segments: list[tuple[tuple[float, float], tuple[float, float]]] | None = None,
+    prior_areas: list[dict[str, Any]] | None = None,
 ) -> Iterator[Any]:
     """Scan, detect and immediately spray one survey cluster."""
     tag = f"survey_{survey_index:02d}"
@@ -1207,13 +1390,13 @@ def scan_detect_spray(
             )
             yield scan_step
             if scan_result["timed_out"]:
-                log(f"[PILOT] fine scan leg {leg_index} incomplete")
+                log(f"[AOI] fine scan leg {leg_index} incomplete")
         finally:
             ctx.scheduler.unschedule(mapping)
 
     # Detect only from frames collected in this survey.
     areas = stress_map.stress_areas()
-    save_stress_areas(areas)  # keep detections even if spray is interrupted
+    save_stress_areas((prior_areas or []) + areas)
     log(
         f"[EXAMPLE] {tag}: {stress_map.pictures} picture(s) -> "
         f"{len(areas)} stress area(s); colour stats={stress_map.stats}; "
@@ -1420,7 +1603,7 @@ class StressMap:
         self.exposure_gain_sum = 0.0
         self.exposure_frames = 0
         self.stats: dict[str, float | int] = {}
-        self.pilot_bounds = pilot_bounds() if scan_segments is not None else None
+        self.aoi_mask: np.ndarray | None = None
 
         # A camera frame also sees roads and neighbouring parcels. Limit
         # candidate spray areas to the 5 m corridor around this survey route.
@@ -1434,16 +1617,30 @@ class StressMap:
         if scan_segments is not None:
             for start, end in scan_segments:
                 cv2.line(self.survey_mask, pixel(start), pixel(end), 1, thickness)
-            # The camera sees beyond a scan line. Do not report/spray crop
-            # outside the single field cluster chosen for this pilot.
-            pilot_x0, pilot_x1, pilot_y0, pilot_y1 = self.pilot_bounds
-            cell_x = self.x0 + (np.arange(cols) + 0.5) * CELL_M
-            cell_y = self.y0 + (np.arange(rows) + 0.5) * CELL_M
-            inside_pilot = ((cell_y[:, None] >= pilot_y0)
-                            & (cell_y[:, None] <= pilot_y1)
-                            & (cell_x[None, :] >= pilot_x0)
-                            & (cell_x[None, :] <= pilot_x1))
-            self.survey_mask &= inside_pilot.astype(np.uint8)
+            # Clip mapped crop to the true AOI polygon, not its bounding box.
+            self.aoi_mask = np.zeros((rows, cols), dtype=np.uint8)
+            aoi_vertices = np.array([pixel(p) for p in AOI_POLYGON_ENU], dtype=np.int32)
+            cv2.fillPoly(self.aoi_mask, [aoi_vertices], 1)
+            forbidden = np.zeros((rows, cols), dtype=np.uint8)
+            for polygon in NO_FLY_ZONES_ENU.values():
+                px = [p[0] for p in polygon]
+                py = [p[1] for p in polygon]
+                if (max(px) < self.x0 - NO_FLY_CLEARANCE_M
+                        or min(px) > self.x0 + cols * CELL_M + NO_FLY_CLEARANCE_M
+                        or max(py) < self.y0 - NO_FLY_CLEARANCE_M
+                        or min(py) > self.y0 + rows * CELL_M + NO_FLY_CLEARANCE_M):
+                    continue
+                vertices = np.array([pixel(p) for p in polygon], dtype=np.int32)
+                cv2.fillPoly(forbidden, [vertices], 1)
+            if np.any(forbidden):
+                buffer_cells = math.ceil(NO_FLY_CLEARANCE_M / CELL_M)
+                buffer_kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (2 * buffer_cells + 1, 2 * buffer_cells + 1),
+                )
+                forbidden = cv2.dilate(forbidden, buffer_kernel)
+                self.aoi_mask[forbidden > 0] = 0
+            self.survey_mask &= self.aoi_mask
         else:
             route = [pixel((x, y)) for x, y, _ in waypoints_enu]
             if len(route) == 1:
@@ -1453,18 +1650,17 @@ class StressMap:
                     cv2.line(self.survey_mask, start, end, 1, thickness)
 
     def snap(self, ctx: Any) -> None:
-        """Take a picture with the Snapshot service and add it to the map."""
+        """Read the latest RGB frame without writing a PNG to cloud storage."""
         camera = ctx.senses.camera
         if not camera.has_frame or camera.seq == self._last_seq:   # no new frame yet
             return
         pose = ctx.senses.pose.current_position
         if pose is None:
             return
-        path = ctx.services.snapshot.snap()
-        picture = cv2.imread(path) if path else None      # BGR
-        if picture is None:
+        rgb = camera.decode()  # SkyTrack /camera is rgb8.
+        if rgb is None:
             return
-        self.add_picture(cv2.cvtColor(picture, cv2.COLOR_BGR2RGB), pose)
+        self.add_picture(rgb, pose)
         self._last_seq = camera.seq
         self.pictures += 1
 
@@ -1709,17 +1905,10 @@ class StressMap:
                * np.count_nonzero(spray_kernel))
             & ~dark_nearby
         ).astype(np.uint8)
-        if self.pilot_bounds is not None:
-            # Keep the entire nozzle cone inside the pilot field envelope.
-            pilot_x0, pilot_x1, pilot_y0, pilot_y1 = self.pilot_bounds
-            edge = SPRAY_SWATH_M / 2.0 + SPRAY_FOOTPRINT_MARGIN_M
-            cell_x = self.x0 + (np.arange(self.spray_mask.shape[1]) + 0.5) * CELL_M
-            cell_y = self.y0 + (np.arange(self.spray_mask.shape[0]) + 0.5) * CELL_M
-            inside_nozzle = ((cell_x[None, :] >= pilot_x0 + edge)
-                             & (cell_x[None, :] <= pilot_x1 - edge)
-                             & (cell_y[:, None] >= pilot_y0 + edge)
-                             & (cell_y[:, None] <= pilot_y1 - edge))
-            self.spray_mask &= inside_nozzle.astype(np.uint8)
+        if self.aoi_mask is not None:
+            # The entire nozzle footprint must stay inside crop and outside
+            # the residential buffer, not just the centre of the drone.
+            self.spray_mask &= cv2.erode(self.aoi_mask, spray_kernel)
         contours, _ = cv2.findContours(
             stressed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
         )
@@ -1852,7 +2041,7 @@ def _inside_runs(points: list[tuple[float, float]], across: float) -> list[tuple
 
 
 def main() -> None:
-    with boot_drone() as drone:         # camera and Snapshot come with the node
+    with boot_drone() as drone:         # the app provides the RGB camera sense
         drone.add_service(BatteryMonitor())
         drone.add_service(Sprayer())
         drone.fly(hackathon_mission)
